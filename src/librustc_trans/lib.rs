@@ -30,6 +30,8 @@
 #![feature(optin_builtin_traits)]
 #![feature(inclusive_range_fields)]
 
+#![recursion_limit="256"]
+
 use rustc::dep_graph::WorkProduct;
 use syntax_pos::symbol::Symbol;
 
