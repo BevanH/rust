@@ -2113,28 +2113,31 @@ macro_rules! intern_method {
                                             $needs_infer:expr) -> $ty:ty) => {
         impl<'a, 'gcx, $lt_tcx> TyCtxt<'a, 'gcx, $lt_tcx> {
             pub fn $method(self, v: $alloc) -> &$lt_tcx $ty {
-                {
-                    let key = ($alloc_to_key)(&v);
-                    if let Some(i) = self.interners.$name.borrow().get(key) {
+                let key = ($alloc_to_key)(&v);
+                let mut interner = self.interners.$name.borrow_mut();
+                if let Some(i) = interner.get(key) {
+                    return i.0;
+                }
+                let global_interner = if !self.is_global() {
+                    let global_interner = self.global_interners.$name.borrow_mut();
+                    if let Some(i) = global_interner.get(key) {
                         return i.0;
                     }
-                    if !self.is_global() {
-                        if let Some(i) = self.global_interners.$name.borrow().get(key) {
-                            return i.0;
-                        }
-                    }
-                }
+                    Some(global_interner)
+                } else {
+                    None
+                };
 
                 // HACK(eddyb) Depend on flags being accurate to
                 // determine that all contents are in the global tcx.
                 // See comments on Lift for why we can't use that.
                 if !($needs_infer)(&v) {
-                    if !self.is_global() {
+                    if let Some(mut global_interners) = global_interner {
                         let v = unsafe {
                             mem::transmute(v)
                         };
                         let i = ($alloc_to_ret)(self.global_interners.arena.$alloc_method(v));
-                        self.global_interners.$name.borrow_mut().insert(Interned(i));
+                        global_interners.insert(Interned(i));
                         return i;
                     }
                 } else {
@@ -2148,7 +2151,7 @@ macro_rules! intern_method {
                 }
 
                 let i = ($alloc_to_ret)(self.interners.arena.$alloc_method(v));
-                self.interners.$name.borrow_mut().insert(Interned(i));
+                interner.insert(Interned(i));
                 i
             }
         }
