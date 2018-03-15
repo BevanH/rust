@@ -117,6 +117,7 @@ fn test_env_impl<F>(source_string: &str,
                                        None,
                                        diagnostic_handler,
                                        Lrc::new(CodeMap::new(FilePathMapping::empty())));
+    driver::spawn_thread_pool(&sess, |gcx_ptr| {
     let cstore = CStore::new(::get_trans(&sess).metadata_loader());
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
     let input = config::Input::Str {
@@ -161,6 +162,7 @@ fn test_env_impl<F>(source_string: &str,
                              "test_crate",
                              tx,
                              &outputs,
+                             gcx_ptr,
                              |tcx| {
         tcx.infer_ctxt().enter(|infcx| {
             let mut region_scope_tree = region::ScopeTree::default();
@@ -175,6 +177,7 @@ fn test_env_impl<F>(source_string: &str,
             infcx.resolve_regions_and_report_errors(def_id, &region_scope_tree, &outlives_env);
             assert_eq!(tcx.sess.err_count(), expected_err_count);
         });
+    });
     });
 }
 
