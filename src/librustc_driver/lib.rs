@@ -35,6 +35,8 @@ extern crate graphviz;
 extern crate env_logger;
 #[cfg(unix)]
 extern crate libc;
+extern crate rayon;
+extern crate rayon_core;
 extern crate rustc;
 extern crate rustc_allocator;
 extern crate rustc_back;
@@ -53,6 +55,7 @@ extern crate rustc_save_analysis;
 extern crate rustc_traits;
 extern crate rustc_trans_utils;
 extern crate rustc_typeck;
+extern crate scoped_tls;
 extern crate serialize;
 #[macro_use]
 extern crate log;
