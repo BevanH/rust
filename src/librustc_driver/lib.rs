@@ -900,6 +900,7 @@ impl<'a> CompilerCalls<'a> for RustcDefaultCalls {
                                                      state.arenas.unwrap(),
                                                      state.output_filenames.unwrap(),
                                                      opt_uii.clone(),
+                                                     state.gcx_ptr.clone(),
                                                      state.out_file);
                 };
             } else {

@@ -48,6 +48,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
 use std::iter;
+use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
 use rustc_data_structures::sync::{Sync, Lrc};
 use std::sync::mpsc;
@@ -108,8 +109,15 @@ pub fn compile_input(
         };
 
         let (krate, registry) = {
-            let mut compile_state =
-                CompileState::state_after_parse(input, sess, outdir, output, krate, &cstore);
+            let mut compile_state = CompileState::state_after_parse(
+                input,
+                sess,
+                outdir,
+                gcx_ptr.clone(),
+                output,
+                krate,
+                &cstore
+            );
             controller_entry_point!(after_parse, sess, compile_state, Ok(()));
 
             (compile_state.krate.unwrap(), compile_state.registry)
@@ -140,6 +148,7 @@ pub fn compile_input(
                         input,
                         sess,
                         outdir,
+                        gcx_ptr.clone(),
                         output,
                         &cstore,
                         expanded_crate,
@@ -206,6 +215,7 @@ pub fn compile_input(
                     input,
                     sess,
                     outdir,
+                    gcx_ptr.clone(),
                     output,
                     &arenas,
                     &cstore,
@@ -239,6 +249,7 @@ pub fn compile_input(
             &arenas,
             &crate_name,
             &outputs,
+            gcx_ptr.clone(),
             |tcx, analysis, rx, result| {
                 {
                     // Eventually, we will want to track plugins.
@@ -247,6 +258,7 @@ pub fn compile_input(
                             input,
                             sess,
                             outdir,
+                            gcx_ptr.clone(),
                             output,
                             opt_crate,
                             tcx.hir.krate(),
@@ -301,7 +313,7 @@ pub fn compile_input(
     controller_entry_point!(
         compilation_done,
         sess,
-        CompileState::state_when_compilation_done(input, sess, outdir, output),
+        CompileState::state_when_compilation_done(input, sess, outdir, gcx_ptr.clone(), output),
         Ok(())
     );
 
@@ -393,6 +405,7 @@ impl<'a> PhaseController<'a> {
 pub struct CompileState<'a, 'tcx: 'a> {
     pub input: &'a Input,
     pub session: &'tcx Session,
+    pub gcx_ptr: Arc<Mutex<usize>>,
     pub krate: Option<ast::Crate>,
     pub registry: Option<Registry<'a>>,
     pub cstore: Option<&'tcx CStore>,
@@ -410,10 +423,15 @@ pub struct CompileState<'a, 'tcx: 'a> {
 }
 
 impl<'a, 'tcx> CompileState<'a, 'tcx> {
-    fn empty(input: &'a Input, session: &'tcx Session, out_dir: &'a Option<PathBuf>) -> Self {
+    fn empty(
+        input: &'a Input,session: &'tcx Session,
+        out_dir: &'a Option<PathBuf>,
+        gcx_ptr: Arc<Mutex<usize>>
+    ) -> Self {
         CompileState {
             input,
             session,
+            gcx_ptr,
             out_dir: out_dir.as_ref().map(|s| &**s),
             out_file: None,
             arenas: None,
@@ -435,6 +453,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
         input: &'a Input,
         session: &'tcx Session,
         out_dir: &'a Option<PathBuf>,
+        gcx_ptr: Arc<Mutex<usize>>,
         out_file: &'a Option<PathBuf>,
         krate: ast::Crate,
         cstore: &'tcx CStore,
@@ -445,7 +464,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
             krate: Some(krate),
             cstore: Some(cstore),
             out_file: out_file.as_ref().map(|s| &**s),
-            ..CompileState::empty(input, session, out_dir)
+            ..CompileState::empty(input, session, out_dir, gcx_ptr)
         }
     }
 
@@ -453,6 +472,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
         input: &'a Input,
         session: &'tcx Session,
         out_dir: &'a Option<PathBuf>,
+        gcx_ptr: Arc<Mutex<usize>>,
         out_file: &'a Option<PathBuf>,
         cstore: &'tcx CStore,
         expanded_crate: &'a ast::Crate,
@@ -463,7 +483,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
             cstore: Some(cstore),
             expanded_crate: Some(expanded_crate),
             out_file: out_file.as_ref().map(|s| &**s),
-            ..CompileState::empty(input, session, out_dir)
+            ..CompileState::empty(input, session, out_dir, gcx_ptr)
         }
     }
 
@@ -471,6 +491,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
         input: &'a Input,
         session: &'tcx Session,
         out_dir: &'a Option<PathBuf>,
+        gcx_ptr: Arc<Mutex<usize>>,
         out_file: &'a Option<PathBuf>,
         arenas: &'tcx AllArenas<'tcx>,
         cstore: &'tcx CStore,
@@ -493,7 +514,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
             hir_crate: Some(hir_crate),
             output_filenames: Some(output_filenames),
             out_file: out_file.as_ref().map(|s| &**s),
-            ..CompileState::empty(input, session, out_dir)
+            ..CompileState::empty(input, session, out_dir, gcx_ptr)
         }
     }
 
@@ -501,6 +522,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
         input: &'a Input,
         session: &'tcx Session,
         out_dir: &'a Option<PathBuf>,
+        gcx_ptr: Arc<Mutex<usize>>,
         out_file: &'a Option<PathBuf>,
         krate: Option<&'a ast::Crate>,
         hir_crate: &'a hir::Crate,
@@ -515,7 +537,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
             hir_crate: Some(hir_crate),
             crate_name: Some(crate_name),
             out_file: out_file.as_ref().map(|s| &**s),
-            ..CompileState::empty(input, session, out_dir)
+            ..CompileState::empty(input, session, out_dir, gcx_ptr)
         }
     }
 
@@ -523,11 +545,12 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
         input: &'a Input,
         session: &'tcx Session,
         out_dir: &'a Option<PathBuf>,
+        gcx_ptr: Arc<Mutex<usize>>,
         out_file: &'a Option<PathBuf>,
     ) -> Self {
         CompileState {
             out_file: out_file.as_ref().map(|s| &**s),
-            ..CompileState::empty(input, session, out_dir)
+            ..CompileState::empty(input, session, out_dir, gcx_ptr)
         }
     }
 }
@@ -1053,6 +1076,7 @@ pub fn phase_3_run_analysis_passes<'tcx, F, R>(
     arenas: &'tcx AllArenas<'tcx>,
     name: &str,
     output_filenames: &OutputFilenames,
+    gcx_ptr: Arc<Mutex<usize>>,
     f: F,
 ) -> Result<R, CompileIncomplete>
 where
@@ -1104,6 +1128,7 @@ where
         name,
         tx,
         output_filenames,
+        gcx_ptr,
         |tcx| {
             // Do some initialization of the DepGraph that can only be done with the
             // tcx available.
