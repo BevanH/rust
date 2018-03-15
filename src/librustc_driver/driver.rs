@@ -65,6 +65,84 @@ use pretty::ReplaceBodyWithLoop;
 
 use profile;
 
+#[cfg(not(parallel_queries))]
+pub fn spawn_thread_pool<F: FnOnce(Arc<Mutex<usize>>) -> R, R>(_: &Session, f: F) -> R {
+    use rustc::util::common::THREAD_INDEX;
+
+    THREAD_INDEX.set(&0, || {
+        f(Arc::new(Mutex::new(0)))
+    })
+}
+
+#[cfg(parallel_queries)]
+pub fn spawn_thread_pool<F: FnOnce(Arc<Mutex<usize>>) -> R, R>(sess: &Session, f: F) -> R {
+    use syntax;
+    use syntax_pos;
+    use scoped_tls::ScopedKey;
+    use rayon::{Configuration, ThreadPool};
+    use rayon_core;
+    use rustc::util::common::THREAD_INDEX;
+
+    let gcx_ptr = Arc::new(Mutex::new(0));
+
+    let arg_gcx_ptr = gcx_ptr.clone();
+
+    let config = Configuration::new().num_threads(sess.query_threads())
+                                     .deadlock_handler(move || {
+                                         ty::maps::deadlock(*gcx_ptr.lock().unwrap());
+                                     }).stack_size(16 * 1024 * 1024);
+
+    let with_pool = move |pool: &ThreadPool| {
+        pool.with_global_registry(|| {
+            THREAD_INDEX.set(&0, || {
+                f(arg_gcx_ptr)
+            })
+        })
+    };
+
+    fn try_with<T, F, R>(key: &'static ScopedKey<T>, f: F) -> R
+        where F: FnOnce(Option<&T>) -> R
+    {
+        if key.is_set() {
+            key.with(|v| f(Some(v)))
+        } else {
+            f(None)
+        }
+    }
+
+    fn maybe_set<T, F, R>(key: &'static ScopedKey<T>,
+                          value: Option<&T>, f: F) -> R
+        where F: FnOnce() -> R
+    {
+        if let Some(v) = value {
+            key.set(v, f)
+        } else {
+            f()
+        }
+    }
+
+    try_with(&syntax::GLOBALS, |syntax_globals| {
+        try_with(&syntax_pos::GLOBALS, |syntax_pos_globals| {
+            let main_handler = move |worker: &mut FnMut()| {
+                let idx = unsafe {
+                    1 + (*rayon_core::registry::WorkerThread::current()).index()
+                };
+                THREAD_INDEX.set(&idx, || {
+                    maybe_set(&syntax::GLOBALS, syntax_globals, || {
+                        maybe_set(&syntax_pos::GLOBALS, syntax_pos_globals, || {
+                            ty::tls::with_thread_locals(|| {
+                                worker()
+                            })
+                        })
+                    })
+                })
+            };
+
+            ThreadPool::scoped_pool(config, main_handler, with_pool).unwrap()
+        })
+    })
+}
+
 pub fn compile_input(
     trans: Box<TransCrate>,
     sess: &Session,
@@ -74,6 +152,32 @@ pub fn compile_input(
     outdir: &Option<PathBuf>,
     output: &Option<PathBuf>,
     addl_plugins: Option<Vec<String>>,
+    control: &CompileController,
+) -> CompileResult {
+    spawn_thread_pool(sess, |gcx_ptr| {
+        compile_input_impl(trans,
+                           sess,
+                           cstore,
+                           input_path,
+                           input,
+                           outdir,
+                           output,
+                           addl_plugins,
+                           gcx_ptr,
+                           control)
+    })
+}
+
+fn compile_input_impl(
+    trans: Box<TransCrate>,
+    sess: &Session,
+    cstore: &CStore,
+    input_path: &Option<PathBuf>,
+    input: &Input,
+    outdir: &Option<PathBuf>,
+    output: &Option<PathBuf>,
+    addl_plugins: Option<Vec<String>>,
+    gcx_ptr: Arc<Mutex<usize>>,
     control: &CompileController,
 ) -> CompileResult {
     macro_rules! controller_entry_point {
