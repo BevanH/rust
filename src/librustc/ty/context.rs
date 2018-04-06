@@ -1201,6 +1201,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                                   crate_name: &str,
                                   tx: mpsc::Sender<Box<dyn Any + Send>>,
                                   output_filenames: &OutputFilenames,
+                                  gcx_ptr: Arc<Mutex<usize>>,
                                   f: F) -> R
                                   where F: for<'b> FnOnce(TyCtxt<'b, 'tcx, 'tcx>) -> R
     {
@@ -1294,7 +1295,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             output_filenames: Arc::new(output_filenames.clone()),
         };
 
-        tls::enter_global(gcx, f)
+        tls::enter_global(gcx, gcx_ptr, f)
     }
 
     pub fn consider_optimizing<T: Fn() -> String>(&self, msg: T) -> bool {
@@ -1837,10 +1838,16 @@ pub mod tls {
     /// creating a initial TyCtxt and ImplicitCtxt.
     /// This happens once per rustc session and TyCtxts only exists
     /// inside the `f` function.
-    pub fn enter_global<'gcx, F, R>(gcx: &GlobalCtxt<'gcx>, f: F) -> R
+    pub fn enter_global<'gcx, F, R>(gcx: &GlobalCtxt<'gcx>, gcx_ptr: Arc<Mutex<usize>>, f: F) -> R
         where F: for<'a> FnOnce(TyCtxt<'a, 'gcx, 'gcx>) -> R
     {
         with_thread_locals(|| {
+            *gcx_ptr.lock().unwrap() = gcx as *const _ as usize;
+
+            let _on_drop = OnDrop(move || {
+                *gcx_ptr.lock().unwrap() = 0;
+            });
+
             let tcx = TyCtxt {
                 gcx,
                 interners: &gcx.global_interners,
