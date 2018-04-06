@@ -63,7 +63,7 @@ pub(super) trait GetCacheInternal<'tcx>: QueryDescription<'tcx> + Sized {
 }
 
 #[derive(Clone)]
-pub(super) struct CycleError<'tcx> {
+pub struct CycleError<'tcx> {
     /// The query and related span which uses the cycle
     pub(super) usage: Option<(Span, Query<'tcx>)>,
     pub(super) cycle: Vec<QueryInfo<'tcx>>,
@@ -226,9 +226,18 @@ macro_rules! define_maps {
         use dep_graph::DepNodeIndex;
         use std::mem;
         use errors::Diagnostic;
+        #[cfg(not(parallel_queries))]
         use errors::FatalError;
         use rustc_data_structures::sync::{Lock, LockGuard};
         use rustc_data_structures::OnDrop;
+        use std::panic;
+        use rayon_core;
+        use {
+            rustc_data_structures::stable_hasher::HashStable,
+            rustc_data_structures::stable_hasher::StableHasherResult,
+            rustc_data_structures::stable_hasher::StableHasher,
+            ich::StableHashingContext
+        };
 
         define_map_struct! {
             tcx: $tcx,
@@ -243,10 +252,23 @@ macro_rules! define_maps {
                     $($name: Lock::new(QueryMap::new())),*
                 }
             }
+
+            pub fn collect_active_jobs(&self) -> Vec<Lrc<QueryJob<$tcx>>> {
+                let mut jobs = Vec::new();
+
+                $(for v in self.$name.lock().map.values() {
+                    match *v {
+                        QueryResult::Started(ref job) => jobs.push(job.clone()),
+                        _ => (),
+                    }
+                })*
+
+                return jobs;
+            }
         }
 
         #[allow(bad_style)]
-        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+        #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
         pub enum Query<$tcx> {
             $($(#[$attr])* $name($K)),*
         }
@@ -290,6 +312,17 @@ macro_rules! define_maps {
                 }
                 match *self {
                     $(Query::$name(key) => key.default_span(tcx),)*
+                }
+            }
+        }
+
+        impl<'a, $tcx> HashStable<StableHashingContext<'a>> for Query<$tcx> {
+            fn hash_stable<W: StableHasherResult>(&self,
+                                                hcx: &mut StableHashingContext<'a>,
+                                                hasher: &mut StableHasher<W>) {
+                mem::discriminant(self).hash_stable(hcx, hasher);
+                match *self {
+                    $(Query::$name(key) => key.hash_stable(hcx, hasher),)*
                 }
             }
         }
@@ -343,7 +376,16 @@ macro_rules! define_maps {
                                 let result = Ok(((&value.value).clone(), value.index));
                                 return TryGetLock::JobCompleted(result);
                             },
-                            QueryResult::Poisoned => FatalError.raise(),
+                            QueryResult::Poisoned => {
+                                #[cfg(not(parallel_queries))]
+                                {
+                                    FatalError.raise();
+                                }
+                                #[cfg(parallel_queries)]
+                                {
+                                    panic::resume_unwind(Box::new(rayon_core::PoisonedJob))
+                                }
+                            },
                         }
                     } else {
                         None
@@ -531,6 +573,7 @@ macro_rules! define_maps {
                             query: Some(job.clone()),
                             layout_depth: icx.layout_depth,
                             task: icx.task,
+                            waiter_cycle: None,
                         };
 
                         // Use the ImplicitCtxt while we execute the query
@@ -930,7 +973,8 @@ pub fn force_from_dep_node<'a, 'gcx, 'lcx>(tcx: TyCtxt<'a, 'gcx, 'lcx>,
                         ::ty::maps::QueryMsg::$query(profq_key!(tcx, $key))
                     )
                 );
-
+                // Forcing doesn't add a read edge, but executing the query may add read edges.
+                // Could this add a `read edge too?
                 match ::ty::maps::queries::$query::force(tcx, $key, span, *dep_node) {
                     Ok(_) => {},
                     Err(e) => {
