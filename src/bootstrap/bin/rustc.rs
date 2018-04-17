@@ -38,6 +38,19 @@ use std::str::FromStr;
 use std::time::Instant;
 
 fn main() {
+    // Show crash dialog
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn SetErrorMode(mode: u32) -> u32;
+        }
+        const SEM_NOGPFAULTERRORBOX: u32 = 0x0002;
+        unsafe {
+            let mode = SetErrorMode(0) & !SEM_NOGPFAULTERRORBOX;
+            SetErrorMode(mode);
+        }
+    }
+
     let mut args = env::args_os().skip(1).collect::<Vec<_>>();
 
     // Append metadata suffix for internal crates. See the corresponding entry
@@ -100,6 +113,7 @@ fn main() {
     dylib_path.insert(0, PathBuf::from(&libdir));
 
     let mut cmd = Command::new(rustc);
+    cmd.env("RUST_BACKTRACE", "1");
     cmd.args(&args)
         .arg("--cfg")
         .arg(format!("stage{}", stage))
