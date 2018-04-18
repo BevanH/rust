@@ -23,7 +23,7 @@ use syntax_pos::symbol::InternedString;
 
 pub trait QueryConfig {
     type Key: Eq + Hash + Clone;
-    type Value;
+    type Value: Clone;
 }
 
 pub(super) trait QueryDescription<'tcx>: QueryConfig {
