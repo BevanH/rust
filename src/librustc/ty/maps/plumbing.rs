@@ -99,6 +99,8 @@ macro_rules! profq_key {
     }
 }
 
+/// A type representing the responsibility to execute the job in the `job` field.
+/// This will poison the relevant query if dropped.
 pub(super) struct JobOwner<'a, 'tcx: 'a, Q: QueryDescription<'tcx> + 'a> {
     map: &'a Lock<QueryMap<'tcx, Q>>,
     key: Q::Key,
@@ -165,6 +167,8 @@ impl<'a, 'tcx, Q: QueryDescription<'tcx>> JobOwner<'a, 'tcx, Q> {
         }
     }
 
+    /// Completes the query by updating the query map with the `result`,
+    /// signals the waiter and forgets the JobOwner, so it won't poison the query
     pub(super) fn complete(self, result: &Q::Value, dep_node_index: DepNodeIndex) {
         // We can move out of `self` here because we `mem::forget` it below
         let key = unsafe { ptr::read(&self.key) };
@@ -180,14 +184,14 @@ impl<'a, 'tcx, Q: QueryDescription<'tcx>> JobOwner<'a, 'tcx, Q> {
         job.signal_complete();
     }
 
-    /// Creates a job for the query and updates the query map indicating that it started.
-    /// Then it changes ImplicitCtxt to point to the new query job while it executes.
-    /// If the query panics, this updates the query map to indicate so.
+    /// Executes a job by changing the ImplicitCtxt to point to the
+    /// new query job while it executes. It returns the diagnostics
+    /// captured during execution and the actual result.
     pub(super) fn start<'lcx, F, R>(
         &self,
         tcx: TyCtxt<'_, 'tcx, 'lcx>,
         compute: F)
-    -> Result<(R, Vec<Diagnostic>), CycleError<'tcx>>
+    -> (R, Vec<Diagnostic>)
     where
         F: for<'b> FnOnce(TyCtxt<'b, 'tcx, 'lcx>) -> R
     {
@@ -538,7 +542,7 @@ macro_rules! define_maps {
                         tcx.dep_graph.with_anon_task(dep_node.kind, || {
                             Self::compute_result(tcx.global_tcx(), key)
                         })
-                    })?;
+                    });
 
                     profq_msg!(tcx, ProfileQueriesMsg::ProviderEnd);
                     let ((result, dep_node_index), diagnostics) = res;
@@ -649,7 +653,7 @@ macro_rules! define_maps {
                         tcx.dep_graph.with_ignore(|| {
                             Self::compute_result(tcx, key)
                         })
-                    })?;
+                    });
                     result
                 };
 
@@ -736,7 +740,7 @@ macro_rules! define_maps {
                                                 key,
                                                 Self::compute_result)
                     }
-                })?;
+                });
                 profq_msg!(tcx, ProfileQueriesMsg::ProviderEnd);
 
                 let ((result, dep_node_index), diagnostics) = res;
