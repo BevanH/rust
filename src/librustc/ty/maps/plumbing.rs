@@ -217,7 +217,7 @@ impl<'a, 'tcx, Q: QueryDescription<'tcx>> JobOwner<'a, 'tcx, Q> {
         // Extract the diagnostic from the job
         let diagnostics = mem::replace(&mut *self.job.diagnostics.lock(), Vec::new());
 
-        Ok((r, diagnostics))
+        (r, diagnostics)
     }
 }
 
