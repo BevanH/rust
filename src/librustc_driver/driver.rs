@@ -48,8 +48,9 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
 use std::iter;
+use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
-use rustc_data_structures::sync::Lrc;
+use rustc_data_structures::sync::{Sync, Lrc};
 use std::sync::mpsc;
 use syntax::{self, ast, attr, diagnostics, visit};
 use syntax::ext::base::ExtCtxt;
@@ -64,6 +65,84 @@ use pretty::ReplaceBodyWithLoop;
 
 use profile;
 
+#[cfg(not(parallel_queries))]
+pub fn spawn_thread_pool<F: FnOnce(Arc<Mutex<usize>>) -> R, R>(_: &Session, f: F) -> R {
+    use rustc::util::common::THREAD_INDEX;
+
+    THREAD_INDEX.set(&0, || {
+        f(Arc::new(Mutex::new(0)))
+    })
+}
+
+#[cfg(parallel_queries)]
+pub fn spawn_thread_pool<F: FnOnce(Arc<Mutex<usize>>) -> R, R>(sess: &Session, f: F) -> R {
+    use syntax;
+    use syntax_pos;
+    use scoped_tls::ScopedKey;
+    use rayon::{Configuration, ThreadPool};
+    use rayon_core;
+    use rustc::util::common::THREAD_INDEX;
+
+    let gcx_ptr = Arc::new(Mutex::new(0));
+
+    let arg_gcx_ptr = gcx_ptr.clone();
+
+    let config = Configuration::new().num_threads(sess.query_threads())
+                                     .deadlock_handler(move || {
+                                         ty::maps::deadlock(*gcx_ptr.lock().unwrap());
+                                     }).stack_size(16 * 1024 * 1024);
+
+    let with_pool = move |pool: &ThreadPool| {
+        pool.with_global_registry(|| {
+            THREAD_INDEX.set(&0, || {
+                f(arg_gcx_ptr)
+            })
+        })
+    };
+
+    fn try_with<T, F, R>(key: &'static ScopedKey<T>, f: F) -> R
+        where F: FnOnce(Option<&T>) -> R
+    {
+        if key.is_set() {
+            key.with(|v| f(Some(v)))
+        } else {
+            f(None)
+        }
+    }
+
+    fn maybe_set<T, F, R>(key: &'static ScopedKey<T>,
+                          value: Option<&T>, f: F) -> R
+        where F: FnOnce() -> R
+    {
+        if let Some(v) = value {
+            key.set(v, f)
+        } else {
+            f()
+        }
+    }
+
+    try_with(&syntax::GLOBALS, |syntax_globals| {
+        try_with(&syntax_pos::GLOBALS, |syntax_pos_globals| {
+            let main_handler = move |worker: &mut FnMut()| {
+                let idx = unsafe {
+                    1 + (*rayon_core::registry::WorkerThread::current()).index()
+                };
+                THREAD_INDEX.set(&idx, || {
+                    maybe_set(&syntax::GLOBALS, syntax_globals, || {
+                        maybe_set(&syntax_pos::GLOBALS, syntax_pos_globals, || {
+                            ty::tls::with_thread_locals(|| {
+                                worker()
+                            })
+                        })
+                    })
+                })
+            };
+
+            ThreadPool::scoped_pool(config, main_handler, with_pool).unwrap()
+        })
+    })
+}
+
 pub fn compile_input(
     trans: Box<TransCrate>,
     sess: &Session,
@@ -73,6 +152,32 @@ pub fn compile_input(
     outdir: &Option<PathBuf>,
     output: &Option<PathBuf>,
     addl_plugins: Option<Vec<String>>,
+    control: &CompileController,
+) -> CompileResult {
+    spawn_thread_pool(sess, |gcx_ptr| {
+        compile_input_impl(trans,
+                           sess,
+                           cstore,
+                           input_path,
+                           input,
+                           outdir,
+                           output,
+                           addl_plugins,
+                           gcx_ptr,
+                           control)
+    })
+}
+
+fn compile_input_impl(
+    trans: Box<TransCrate>,
+    sess: &Session,
+    cstore: &CStore,
+    input_path: &Option<PathBuf>,
+    input: &Input,
+    outdir: &Option<PathBuf>,
+    output: &Option<PathBuf>,
+    addl_plugins: Option<Vec<String>>,
+    gcx_ptr: Arc<Mutex<usize>>,
     control: &CompileController,
 ) -> CompileResult {
     macro_rules! controller_entry_point {
@@ -108,8 +213,15 @@ pub fn compile_input(
         };
 
         let (krate, registry) = {
-            let mut compile_state =
-                CompileState::state_after_parse(input, sess, outdir, output, krate, &cstore);
+            let mut compile_state = CompileState::state_after_parse(
+                input,
+                sess,
+                outdir,
+                gcx_ptr.clone(),
+                output,
+                krate,
+                &cstore
+            );
             controller_entry_point!(after_parse, sess, compile_state, Ok(()));
 
             (compile_state.krate.unwrap(), compile_state.registry)
@@ -140,6 +252,7 @@ pub fn compile_input(
                         input,
                         sess,
                         outdir,
+                        gcx_ptr.clone(),
                         output,
                         &cstore,
                         expanded_crate,
@@ -206,6 +319,7 @@ pub fn compile_input(
                     input,
                     sess,
                     outdir,
+                    gcx_ptr.clone(),
                     output,
                     &arenas,
                     &cstore,
@@ -239,6 +353,7 @@ pub fn compile_input(
             &arenas,
             &crate_name,
             &outputs,
+            gcx_ptr.clone(),
             |tcx, analysis, rx, result| {
                 {
                     // Eventually, we will want to track plugins.
@@ -247,6 +362,7 @@ pub fn compile_input(
                             input,
                             sess,
                             outdir,
+                            gcx_ptr.clone(),
                             output,
                             opt_crate,
                             tcx.hir.krate(),
@@ -301,7 +417,7 @@ pub fn compile_input(
     controller_entry_point!(
         compilation_done,
         sess,
-        CompileState::state_when_compilation_done(input, sess, outdir, output),
+        CompileState::state_when_compilation_done(input, sess, outdir, gcx_ptr.clone(), output),
         Ok(())
     );
 
@@ -393,6 +509,7 @@ impl<'a> PhaseController<'a> {
 pub struct CompileState<'a, 'tcx: 'a> {
     pub input: &'a Input,
     pub session: &'tcx Session,
+    pub gcx_ptr: Arc<Mutex<usize>>,
     pub krate: Option<ast::Crate>,
     pub registry: Option<Registry<'a>>,
     pub cstore: Option<&'tcx CStore>,
@@ -410,10 +527,15 @@ pub struct CompileState<'a, 'tcx: 'a> {
 }
 
 impl<'a, 'tcx> CompileState<'a, 'tcx> {
-    fn empty(input: &'a Input, session: &'tcx Session, out_dir: &'a Option<PathBuf>) -> Self {
+    fn empty(
+        input: &'a Input,session: &'tcx Session,
+        out_dir: &'a Option<PathBuf>,
+        gcx_ptr: Arc<Mutex<usize>>
+    ) -> Self {
         CompileState {
             input,
             session,
+            gcx_ptr,
             out_dir: out_dir.as_ref().map(|s| &**s),
             out_file: None,
             arenas: None,
@@ -435,6 +557,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
         input: &'a Input,
         session: &'tcx Session,
         out_dir: &'a Option<PathBuf>,
+        gcx_ptr: Arc<Mutex<usize>>,
         out_file: &'a Option<PathBuf>,
         krate: ast::Crate,
         cstore: &'tcx CStore,
@@ -445,7 +568,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
             krate: Some(krate),
             cstore: Some(cstore),
             out_file: out_file.as_ref().map(|s| &**s),
-            ..CompileState::empty(input, session, out_dir)
+            ..CompileState::empty(input, session, out_dir, gcx_ptr)
         }
     }
 
@@ -453,6 +576,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
         input: &'a Input,
         session: &'tcx Session,
         out_dir: &'a Option<PathBuf>,
+        gcx_ptr: Arc<Mutex<usize>>,
         out_file: &'a Option<PathBuf>,
         cstore: &'tcx CStore,
         expanded_crate: &'a ast::Crate,
@@ -463,7 +587,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
             cstore: Some(cstore),
             expanded_crate: Some(expanded_crate),
             out_file: out_file.as_ref().map(|s| &**s),
-            ..CompileState::empty(input, session, out_dir)
+            ..CompileState::empty(input, session, out_dir, gcx_ptr)
         }
     }
 
@@ -471,6 +595,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
         input: &'a Input,
         session: &'tcx Session,
         out_dir: &'a Option<PathBuf>,
+        gcx_ptr: Arc<Mutex<usize>>,
         out_file: &'a Option<PathBuf>,
         arenas: &'tcx AllArenas<'tcx>,
         cstore: &'tcx CStore,
@@ -493,7 +618,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
             hir_crate: Some(hir_crate),
             output_filenames: Some(output_filenames),
             out_file: out_file.as_ref().map(|s| &**s),
-            ..CompileState::empty(input, session, out_dir)
+            ..CompileState::empty(input, session, out_dir, gcx_ptr)
         }
     }
 
@@ -501,6 +626,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
         input: &'a Input,
         session: &'tcx Session,
         out_dir: &'a Option<PathBuf>,
+        gcx_ptr: Arc<Mutex<usize>>,
         out_file: &'a Option<PathBuf>,
         krate: Option<&'a ast::Crate>,
         hir_crate: &'a hir::Crate,
@@ -515,7 +641,7 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
             hir_crate: Some(hir_crate),
             crate_name: Some(crate_name),
             out_file: out_file.as_ref().map(|s| &**s),
-            ..CompileState::empty(input, session, out_dir)
+            ..CompileState::empty(input, session, out_dir, gcx_ptr)
         }
     }
 
@@ -523,11 +649,12 @@ impl<'a, 'tcx> CompileState<'a, 'tcx> {
         input: &'a Input,
         session: &'tcx Session,
         out_dir: &'a Option<PathBuf>,
+        gcx_ptr: Arc<Mutex<usize>>,
         out_file: &'a Option<PathBuf>,
     ) -> Self {
         CompileState {
             out_file: out_file.as_ref().map(|s| &**s),
-            ..CompileState::empty(input, session, out_dir)
+            ..CompileState::empty(input, session, out_dir, gcx_ptr)
         }
     }
 }
@@ -1046,13 +1173,14 @@ pub fn phase_3_run_analysis_passes<'tcx, F, R>(
     trans: &TransCrate,
     control: &CompileController,
     sess: &'tcx Session,
-    cstore: &'tcx CrateStore,
+    cstore: &'tcx (CrateStore + Sync),
     hir_map: hir_map::Map<'tcx>,
     mut analysis: ty::CrateAnalysis,
     resolutions: Resolutions,
     arenas: &'tcx AllArenas<'tcx>,
     name: &str,
     output_filenames: &OutputFilenames,
+    gcx_ptr: Arc<Mutex<usize>>,
     f: F,
 ) -> Result<R, CompileIncomplete>
 where
@@ -1104,6 +1232,7 @@ where
         name,
         tx,
         output_filenames,
+        gcx_ptr,
         |tcx| {
             // Do some initialization of the DepGraph that can only be done with the
             // tcx available.
@@ -1149,17 +1278,15 @@ where
 
             time(sess, "borrow checking", || borrowck::check_crate(tcx));
 
-            time(sess, "MIR borrow checking", || {
-                for def_id in tcx.body_owners() {
-                    tcx.mir_borrowck(def_id);
-                }
-            });
+            time(sess,
+                 "MIR borrow checking",
+                 || tcx.par_body_owners(|def_id| { tcx.mir_borrowck(def_id); }));
 
-            time(sess, "MIR effect checking", || {
-                for def_id in tcx.body_owners() {
-                    mir::transform::check_unsafety::check_unsafety(tcx, def_id)
-                }
-            });
+            time(sess,
+                 "MIR effect checking",
+                 || tcx.par_body_owners(|def_id| {
+                     mir::transform::check_unsafety::check_unsafety(tcx.global_tcx(), def_id)
+                 }));
             // Avoid overwhelming user with errors if type checking failed.
             // I'm not sure how helpful this is, to be honest, but it avoids
             // a

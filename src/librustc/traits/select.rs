@@ -44,13 +44,12 @@ use ty::relate::TypeRelation;
 use middle::lang_items;
 use mir::interpret::{GlobalId};
 
+use rustc_data_structures::sync::{Lrc, Lock};
 use rustc_data_structures::bitvec::BitVector;
 use std::iter;
-use std::cell::RefCell;
 use std::cmp;
 use std::fmt;
 use std::mem;
-use std::rc::Rc;
 use syntax::abi::Abi;
 use hir;
 use util::nodemap::{FxHashMap, FxHashSet};
@@ -143,7 +142,7 @@ struct TraitObligationStack<'prev, 'tcx: 'prev> {
 
 #[derive(Clone)]
 pub struct SelectionCache<'tcx> {
-    hashmap: RefCell<FxHashMap<ty::TraitRef<'tcx>,
+    hashmap: Lock<FxHashMap<ty::TraitRef<'tcx>,
                                WithDepNode<SelectionResult<'tcx, SelectionCandidate<'tcx>>>>>,
 }
 
@@ -410,7 +409,7 @@ impl EvaluationResult {
 
 #[derive(Clone)]
 pub struct EvaluationCache<'tcx> {
-    hashmap: RefCell<FxHashMap<ty::PolyTraitRef<'tcx>, WithDepNode<EvaluationResult>>>
+    hashmap: Lock<FxHashMap<ty::PolyTraitRef<'tcx>, WithDepNode<EvaluationResult>>>
 }
 
 impl<'cx, 'gcx, 'tcx> SelectionContext<'cx, 'gcx, 'tcx> {
@@ -3314,7 +3313,7 @@ impl<'tcx> TraitObligation<'tcx> {
         if obligation.recursion_depth >= 0 {
             let derived_cause = DerivedObligationCause {
                 parent_trait_ref: obligation.predicate.to_poly_trait_ref(),
-                parent_code: Rc::new(obligation.cause.code.clone())
+                parent_code: Lrc::new(obligation.cause.code.clone())
             };
             let derived_code = variant(derived_cause);
             ObligationCause::new(obligation.cause.span, obligation.cause.body_id, derived_code)
@@ -3327,7 +3326,7 @@ impl<'tcx> TraitObligation<'tcx> {
 impl<'tcx> SelectionCache<'tcx> {
     pub fn new() -> SelectionCache<'tcx> {
         SelectionCache {
-            hashmap: RefCell::new(FxHashMap())
+            hashmap: Lock::new(FxHashMap())
         }
     }
 
@@ -3339,7 +3338,7 @@ impl<'tcx> SelectionCache<'tcx> {
 impl<'tcx> EvaluationCache<'tcx> {
     pub fn new() -> EvaluationCache<'tcx> {
         EvaluationCache {
-            hashmap: RefCell::new(FxHashMap())
+            hashmap: Lock::new(FxHashMap())
         }
     }
 

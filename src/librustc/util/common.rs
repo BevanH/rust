@@ -22,15 +22,57 @@ use std::panic;
 use std::env;
 use std::path::Path;
 use std::time::{Duration, Instant};
+use std::cell::UnsafeCell;
 
 use std::sync::mpsc::{Sender};
 use syntax_pos::{SpanData};
 use ty::maps::{QueryMsg};
 use ty::TyCtxt;
 use dep_graph::{DepNode};
+use rayon_core::registry::Registry;
 use proc_macro;
 use lazy_static;
 use session::Session;
+
+scoped_thread_local!(pub static THREAD_INDEX: usize);
+
+#[repr(align(64))]
+struct CacheAligned<T>(T);
+
+// FIXME: Find a way to ensure this isn't transferred between multiple thread pools
+// Thread pools should be the only thing that has a valid THREAD_INDEX.
+// Make it contain a Arc<rayon::Registry> and get the index based on the current worker?
+pub struct ThreadLocal<T>(Vec<CacheAligned<UnsafeCell<T>>>);
+
+unsafe impl<T> Send for ThreadLocal<T> {}
+unsafe impl<T> Sync for ThreadLocal<T> {}
+
+impl<T> ThreadLocal<T> {
+    pub fn new<F>(f: F) -> ThreadLocal<T>
+        where F: Fn() -> T,
+    {
+        let n = Registry::current_num_threads();
+        ThreadLocal((0..(1 + n)).map(|_| CacheAligned(UnsafeCell::new(f()))).collect())
+    }
+
+    pub fn into_inner(self) -> Vec<T> {
+        self.0.into_iter().map(|c| c.0.into_inner()).collect()
+    }
+
+    pub fn current(&self) -> &mut T {
+        use std::ops::Index;
+
+        unsafe {
+            &mut *(self.0.index(THREAD_INDEX.with(|t| *t)).0.get())
+        }
+    }
+}
+
+impl<T> ThreadLocal<Vec<T>> {
+    pub fn collect(self) -> Vec<T> {
+        self.into_inner().into_iter().flat_map(|v| v).collect()
+    }
+}
 
 // The name of the associated type for `Fn` return types
 pub const FN_OUTPUT_NAME: &'static str = "Output";
@@ -159,6 +201,20 @@ pub fn time_ext<T, F>(do_it: bool, sess: Option<&Session>, what: &str, f: F) -> 
             profq_msg(sess, ProfileQueriesMsg::TimeBegin(what.to_string()))
         }
     }
+
+    #[cfg(not(all(windows, parallel_queries, any(target_arch = "x86", target_arch = "x86_64"))))]
+    let rv = time_impl(sess, what, f);
+    #[cfg(all(windows, parallel_queries, any(target_arch = "x86", target_arch = "x86_64")))]
+    let rv = time_threads_impl(sess, what, f);
+
+    TIME_DEPTH.with(|slot| slot.set(old));
+
+    rv
+}
+
+fn time_impl<T, F>(sess: Option<&Session>, what: &str, f: F) -> T where
+    F: FnOnce() -> T,
+{
     let start = Instant::now();
     let rv = f();
     let dur = start.elapsed();
@@ -167,12 +223,98 @@ pub fn time_ext<T, F>(do_it: bool, sess: Option<&Session>, what: &str, f: F) -> 
             profq_msg(sess, ProfileQueriesMsg::TimeEnd)
         }
     }
-
-    print_time_passes_entry_internal(what, dur);
-
-    TIME_DEPTH.with(|slot| slot.set(old));
-
+    print_time_passes_entry_internal(what, duration_to_secs_str(dur));
     rv
+}
+
+#[cfg(all(windows, parallel_queries, any(target_arch = "x86", target_arch = "x86_64")))]
+fn time_threads_impl<T, F>(sess: Option<&Session>, what: &str, f: F) -> T where
+    F: FnOnce() -> T,
+{
+    use rayon_core::registry;
+    use std::iter;
+    use winapi;
+    use kernel32;
+
+    #[allow(unused_mut)]
+    fn read_counter() -> u64 {
+        let mut low: u32;
+        let mut high: u32;
+
+        unsafe {
+            asm!("xor %rax, %rax; cpuid; rdtsc"
+                : "={eax}" (low), "={edx}" (high) :: "memory", "rbx", "rcx");
+        }
+
+        ((high as u64) << 32) | (low as u64)
+    }
+
+    let registry = registry::get_current_registry();
+    if let Some(registry) = registry {
+        let freq = unsafe {
+            let mut freq = 0;
+            assert!(kernel32::QueryPerformanceFrequency(&mut freq) == winapi::TRUE);
+            freq as u64 * 1000
+        };
+
+        let threads: Vec<_> = {
+            let threads = registry.handles.lock();
+            let current = unsafe {
+                iter::once(kernel32::GetCurrentThread())
+            };
+            current.chain(threads.iter().map(|t| t.0)).collect()
+        };
+        let mut begin: Vec<u64> = iter::repeat(0).take(threads.len()).collect();
+        let mut end: Vec<u64> = iter::repeat(0).take(threads.len()).collect();
+        for (i, &handle) in threads.iter().enumerate() {
+            unsafe {
+                assert!(kernel32::QueryThreadCycleTime(handle, &mut begin[i]) == winapi::TRUE);
+            }
+        }
+
+        let time_start = read_counter();
+        let result = f();
+        let time_end = read_counter();
+        for (i, &handle) in threads.iter().enumerate() {
+            unsafe {
+                assert!(kernel32::QueryThreadCycleTime(handle, &mut end[i]) == winapi::TRUE);
+            }
+        }
+        if let Some(sess) = sess {
+            if cfg!(debug_assertions) {
+                profq_msg(sess, ProfileQueriesMsg::TimeEnd)
+            }
+        }
+        let time = time_end - time_start;
+        let time_secs = time as f64 / freq as f64;
+
+        let thread_times: Vec<u64> = end.iter().zip(begin.iter()).map(|(e, b)| *e - *b).collect();
+
+        let total_thread_time: u64 = thread_times.iter().cloned().sum();
+        let core_usage = total_thread_time as f64 / time as f64;
+
+        let mut data = format!("{:.6} - cores {:.2}x - cpu {:.2} - threads (",
+                           time_secs,
+                           core_usage,
+                           core_usage / (thread_times.len() - 1) as f64);
+
+        for (i, thread_time) in thread_times.into_iter().enumerate() {
+            data.push_str(&format!("{:.2}", thread_time as f64 / time as f64));
+            if i == 0 {
+                data.push_str(" - ");
+            }
+            else if i < begin.len() - 1 {
+                data.push_str(" ");
+            }
+        }
+
+        data.push_str(")");
+
+        print_time_passes_entry_internal(what, data);
+        result
+    } else {
+        time_impl(sess, what, f)
+    }
 }
 
 pub fn print_time_passes_entry(do_it: bool, what: &str, dur: Duration) {
@@ -186,12 +328,12 @@ pub fn print_time_passes_entry(do_it: bool, what: &str, dur: Duration) {
         r
     });
 
-    print_time_passes_entry_internal(what, dur);
+    print_time_passes_entry_internal(what, duration_to_secs_str(dur));
 
     TIME_DEPTH.with(|slot| slot.set(old));
 }
 
-fn print_time_passes_entry_internal(what: &str, dur: Duration) {
+fn print_time_passes_entry_internal(what: &str, data: String) {
     let indentation = TIME_DEPTH.with(|slot| slot.get());
 
     let mem_string = match get_resident() {
@@ -203,7 +345,7 @@ fn print_time_passes_entry_internal(what: &str, dur: Duration) {
     };
     println!("{}time: {}{}\t{}",
              repeat("  ").take(indentation).collect::<String>(),
-             duration_to_secs_str(dur),
+             data,
              mem_string,
              what);
 }
@@ -215,7 +357,7 @@ pub fn duration_to_secs_str(dur: Duration) -> String {
     let secs = dur.as_secs() as f64 +
                dur.subsec_nanos() as f64 / NANOS_PER_SEC;
 
-    format!("{:.3}", secs)
+    format!("{:.6}", secs)
 }
 
 pub fn to_readable_str(mut val: usize) -> String {

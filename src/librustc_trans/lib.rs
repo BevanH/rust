@@ -30,6 +30,8 @@
 #![feature(optin_builtin_traits)]
 #![feature(inclusive_range_fields)]
 
+#![recursion_limit="256"]
+
 use rustc::dep_graph::WorkProduct;
 use syntax_pos::symbol::Symbol;
 
@@ -37,9 +39,9 @@ use syntax_pos::symbol::Symbol;
 extern crate bitflags;
 extern crate flate2;
 extern crate libc;
+extern crate rayon;
 #[macro_use] extern crate rustc;
 extern crate jobserver;
-extern crate num_cpus;
 extern crate rustc_mir;
 extern crate rustc_allocator;
 extern crate rustc_apfloat;
@@ -270,6 +272,7 @@ pub fn __rustc_codegen_backend() -> Box<TransCrate> {
     LlvmTransCrate::new()
 }
 
+#[derive(Debug)]
 struct ModuleTranslation {
     /// The name of the module. When the crate may be saved between
     /// compilations, incremental compilation requires that name be
@@ -346,6 +349,7 @@ struct CompiledModule {
     bytecode_compressed: Option<PathBuf>,
 }
 
+#[derive(Debug)]
 enum ModuleSource {
     /// Copy the `.o` files or whatever from the incr. comp. directory.
     Preexisting(WorkProduct),

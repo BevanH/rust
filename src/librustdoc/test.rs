@@ -103,6 +103,7 @@ pub fn run(input_path: &Path,
     target_features::add_configuration(&mut cfg, &sess, &*trans);
     sess.parse_sess.config = cfg;
 
+    driver::spawn_thread_pool(&sess, |_| {
     let krate = panictry!(driver::phase_1_parse_input(&driver::CompileController::basic(),
                                                       &sess,
                                                       &input));
@@ -156,6 +157,7 @@ pub fn run(input_path: &Path,
                        collector.tests.into_iter().collect(),
                        testing::Options::new().display_output(display_warnings));
     0
+    })
 }
 
 // Look for #![doc(test(no_crate_inject))], used by crates in the std facade

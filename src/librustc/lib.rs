@@ -40,6 +40,8 @@
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/")]
 
+#![feature(asm)]
+#![feature(attr_literals)]
 #![feature(box_patterns)]
 #![feature(box_syntax)]
 #![feature(const_fn)]
@@ -49,6 +51,7 @@
 #![feature(entry_or_default)]
 #![feature(from_ref)]
 #![feature(fs_read_write)]
+#![feature(iterator_step_by)]
 #![cfg_attr(windows, feature(libc))]
 #![feature(macro_lifetime_matcher)]
 #![feature(macro_vis_matcher)]
@@ -59,6 +62,7 @@
 #![feature(quote)]
 #![feature(refcell_replace_swap)]
 #![feature(rustc_diagnostic_macros)]
+#![feature(set_stdio)]
 #![feature(slice_patterns)]
 #![feature(slice_sort_by_cached_key)]
 #![feature(specialization)]
@@ -68,6 +72,7 @@
 #![feature(catch_expr)]
 #![feature(test)]
 #![feature(inclusive_range_fields)]
+#![feature(vec_remove_item)]
 
 #![recursion_limit="512"]
 
@@ -78,16 +83,24 @@ extern crate fmt_macros;
 extern crate getopts;
 extern crate graphviz;
 #[macro_use] extern crate lazy_static;
+extern crate num_cpus;
 #[cfg(windows)]
 extern crate libc;
+#[cfg(windows)]
+extern crate kernel32;
+#[cfg(windows)]
+extern crate winapi;
 extern crate rustc_back;
 #[macro_use] extern crate rustc_data_structures;
 extern crate serialize;
 extern crate rustc_const_math;
 extern crate rustc_errors as errors;
+extern crate rayon;
+extern crate rayon_core;
 #[macro_use] extern crate log;
 #[macro_use] extern crate syntax;
 extern crate syntax_pos;
+#[macro_use] extern crate scoped_tls;
 extern crate jobserver;
 extern crate proc_macro;
 

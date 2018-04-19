@@ -25,6 +25,8 @@
 #![feature(entry_and_modify)]
 #![feature(dyn_trait)]
 
+#![recursion_limit="256"]
+
 extern crate arena;
 extern crate getopts;
 extern crate env_logger;
